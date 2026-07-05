@@ -143,6 +143,15 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
   #statusbar .warn { color: #b45309; font-weight: 600; }
   .link-btn { background: none; border: none; color: var(--accent); font-size: 11px; cursor: pointer; text-decoration: underline; padding: 0; }
+  .fund-inputs { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+  .fund-inputs label { font-size: 11px; color: var(--sub); font-weight: 600; display: flex; flex-direction: column; gap: 4px; }
+  .fund-inputs .amt-input { width: 140px; }
+  .gauge-track { background: #eef1f6; border-radius: 8px; height: 26px; overflow: hidden; }
+  .gauge-fill { height: 100%; border-radius: 8px 0 0 8px; transition: width .3s; min-width: 2px; }
+  .gauge-legend { display: flex; justify-content: space-between; font-size: 11px; color: var(--sub); margin-top: 6px; }
+  .verdict { font-size: 15px; font-weight: 700; margin-top: 10px; }
+  .verdict.ok { color: var(--green); }
+  .verdict.ng { color: var(--red); }
   .reload { font-size: 12px; color: var(--accent); cursor: pointer; background: none; border: none; text-decoration: underline; }
   tfoot td { font-weight: 700; border-top: 2px solid var(--text); border-bottom: none; }
 </style>
@@ -164,6 +173,15 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       <div class="card"><div class="label">当月支出合計</div><div class="value" id="kpi-total"></div><div class="delta" id="kpi-delta"></div></div>
       <div class="card"><div class="label">年間累計（当月まで）</div><div class="value" id="kpi-cum"></div></div>
       <div class="card"><div class="label">月平均（入力済み月）</div><div class="value" id="kpi-avg"></div></div>
+    </div>
+
+    <div class="panel" style="margin-bottom:16px">
+      <h2>資金チェック（この月の引き落としに足りる？）</h2>
+      <div class="fund-inputs">
+        <label>給料（手取り）<input class="amt-input" type="text" inputmode="numeric" id="inc-salary" placeholder="0" onchange="onIncome('s', this)"></label>
+        <label>プール資金<input class="amt-input" type="text" inputmode="numeric" id="inc-pool" placeholder="0" onchange="onIncome('p', this)"></label>
+      </div>
+      <div id="fund-viz"></div>
     </div>
 
     <div class="grid2">
@@ -420,6 +438,25 @@ function render(){
     + (dirty ? '<span class="warn">⚠️ Excelファイルには未反映</span>' : '')
     + `<button class="link-btn" onclick="pickFile()">Excelファイルを読み込み直す</button>`;
 
+  // 資金チェック: 給料+プール資金 vs 当月引き落とし合計
+  const inc = getIncome(current);
+  document.getElementById('inc-salary').value = inc.s || '';
+  document.getElementById('inc-pool').value = inc.p || '';
+  const incTotal = (inc.s || 0) + (inc.p || 0);
+  const viz = document.getElementById('fund-viz');
+  if(incTotal === 0){
+    viz.innerHTML = '<p style="color:var(--sub);font-size:12px">給料とプール資金を入力すると、この月の引き落とし合計に足りるかを判定します（入力は月ごとにこの端末へ自動保存）</p>';
+  } else {
+    const pct = total / incTotal;
+    const diff = incTotal - total;
+    const ok = diff >= 0;
+    const width = Math.min(pct, 1) * 100;
+    viz.innerHTML =
+      `<div class="gauge-track"><div class="gauge-fill" style="width:${width}%;background:${ok ? (pct > 0.9 ? '#d97706' : 'var(--green)') : 'var(--red)'}"></div></div>`
+      + `<div class="gauge-legend"><span>引き落とし ${fmt(total)}（用意資金の ${Math.round(pct*100)}%）</span><span>用意資金 ${fmt(incTotal)}</span></div>`
+      + `<div class="verdict ${ok ? 'ok' : 'ng'}">${ok ? '✅ 足りています（残り ' + fmt(diff) + '）' : '⚠️ ' + fmt(-diff) + ' 不足しています'}</div>`;
+  }
+
   renderTrend();
 }
 
@@ -543,6 +580,21 @@ function toggle(item){
   let done = JSON.parse(localStorage.getItem(key) || '[]');
   done = done.includes(item) ? done.filter(x => x !== item) : [...done, item];
   localStorage.setItem(key, JSON.stringify(done));
+  render();
+}
+
+// ===== 給料・プール資金（月ごとにブラウザへ自動保存） =====
+function getIncome(m){
+  const all = JSON.parse(localStorage.getItem('kakei-income') || '{}');
+  return all[m] || { s: 0, p: 0 };
+}
+function onIncome(field, input){
+  const raw = input.value.replace(/[¥,，\s]/g, '');
+  const v = raw === '' ? 0 : Number(raw);
+  if(!isFinite(v)){ input.value = getIncome(current)[field] || ''; return; }
+  const all = JSON.parse(localStorage.getItem('kakei-income') || '{}');
+  all[current] = { ...getIncome(current), [field]: v };
+  localStorage.setItem('kakei-income', JSON.stringify(all));
   render();
 }
 
