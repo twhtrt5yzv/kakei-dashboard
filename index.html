@@ -225,6 +225,14 @@ let DATA = null, current = null;
 let rawBuf = null, fileHandle = null, editMode = false, dirty = false;
 let SHEET_NAME = null, MCOL_LETTER = {}, editedBySheet = {}, lastPersist = null;
 let INCOME = null, INCOME_SHEET = null;
+let FILE_NAME = '家計管理_引き落とし管理.xlsx';
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+// iPhone/iPad: 共有シート経由で「ファイルに保存」できるか
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const CAN_SHARE_FILE = (() => {
+  try { return IS_IOS && !!navigator.canShare && navigator.canShare({ files: [new File(['x'], 't.xlsx', { type: XLSX_MIME })] }); }
+  catch(e){ return false; }
+})();
 
 // ===== ブラウザ内自動保存 (IndexedDB): 開き直してもデータと入力が残る =====
 function idb(){
@@ -253,7 +261,7 @@ async function kvGet(k){
 async function persistState(){
   lastPersist = Date.now();
   try {
-    await kvSet('wb', { buf: rawBuf, dirty, time: lastPersist });
+    await kvSet('wb', { buf: rawBuf, dirty, time: lastPersist, name: FILE_NAME });
     if(fileHandle) await kvSet('handle', fileHandle);
   } catch(e){ /* プライベートブラウズ等では保存不可 */ }
 }
@@ -266,6 +274,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     const saved = await kvGet('wb');
     if(saved && saved.buf){
       try { fileHandle = (await kvGet('handle')) || null; } catch(e){}
+      if(saved.name) FILE_NAME = saved.name;
       parse(new Uint8Array(saved.buf));
       dirty = !!saved.dirty;
       lastPersist = saved.time || null;
@@ -278,6 +287,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     try {
       const r = await fetch(encodeURI(name));
       if(!r.ok) continue;
+      FILE_NAME = name;
       parse(new Uint8Array(await r.arrayBuffer()));
       persistState(); render();
       return;
@@ -314,6 +324,7 @@ fileInput.onchange = e => readFile(e.target.files[0]);
 
 function readFile(f){
   if(!f) return;
+  if(f.name) FILE_NAME = f.name;
   const r = new FileReader();
   r.onload = e => {
     try {
@@ -455,8 +466,10 @@ function render(){
   if(dirty){
     document.getElementById('save-msg').textContent = fileHandle
       ? '未保存の変更があります（元のExcelファイルに上書き保存します）'
-      : '未保存の変更があります（このブラウザでは修正版xlsxをダウンロード保存します）';
-    document.getElementById('save-btn').textContent = fileHandle ? '💾 上書き保存' : '⬇️ ダウンロード保存';
+      : (CAN_SHARE_FILE
+        ? 'Excelファイル未反映の入力があります（保存 → 「ファイルに保存」で反映）'
+        : '未保存の変更があります（このブラウザでは修正版xlsxをダウンロード保存します）');
+    document.getElementById('save-btn').textContent = fileHandle ? '💾 上書き保存' : (CAN_SHARE_FILE ? '📤 保存' : '⬇️ ダウンロード保存');
   }
 
   // ステータスバー: 自動保存の状態と再読み込みボタン
@@ -596,10 +609,20 @@ async function saveFile(){
       const w = await fileHandle.createWritable();
       await w.write(buf); await w.close();
       toast('✅ Excelファイルに上書き保存しました');
+    } else if(CAN_SHARE_FILE){
+      // iPhone: 画面遷移せず共有シート →「ファイルに保存」で家計フォルダへ
+      const file = new File([buf], FILE_NAME, { type: XLSX_MIME });
+      try {
+        await navigator.share({ files: [file] });
+      } catch(e){
+        if(e.name === 'AbortError'){ toast('保存をキャンセルしました'); return; }
+        throw e;
+      }
+      toast('📤 「ファイルに保存」→ 家計フォルダを選べば完了です');
     } else {
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
-      a.download = '家計管理_引き落とし管理.xlsx';
+      a.href = URL.createObjectURL(new Blob([buf], { type: XLSX_MIME }));
+      a.download = FILE_NAME;
       a.click();
       URL.revokeObjectURL(a.href);
       toast('⬇️ ダウンロードしました。元のファイルと置き換えてください');
