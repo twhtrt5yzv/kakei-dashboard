@@ -1,0 +1,9 @@
+{
+  "name": "家計ダッシュボード",
+  "short_name": "家計",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f4f6f9",
+  "theme_color": "#2563eb",
+  "icons": [{ "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }]
+}
