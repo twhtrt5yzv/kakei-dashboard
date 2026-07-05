@@ -223,7 +223,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 const MONTHS = ['4月','5月','6月','7月','8月','9月','10月','11月','12月','1月','2月','3月'];
 let DATA = null, current = null;
 let rawBuf = null, fileHandle = null, editMode = false, dirty = false;
-let SHEET_NAME = null, MCOL_LETTER = {}, editedCells = {}, lastPersist = null;
+let SHEET_NAME = null, MCOL_LETTER = {}, editedBySheet = {}, lastPersist = null;
+let INCOME = null, INCOME_SHEET = null;
 
 // ===== ブラウザ内自動保存 (IndexedDB): 開き直してもデータと入力が残る =====
 function idb(){
@@ -273,10 +274,15 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
   } catch(e){ /* IndexedDB不可なら通常フローへ */ }
   if(location.protocol === 'file:') return;
-  fetch(encodeURI('家計管理_引き落とし管理.xlsx'))
-    .then(r => { if(!r.ok) throw 0; return r.arrayBuffer(); })
-    .then(buf => { parse(new Uint8Array(buf)); persistState(); render(); })
-    .catch(() => {});
+  for(const name of ['⭐️家計管理_引き落とし管理.xlsx', '家計管理_引き落とし管理.xlsx']){
+    try {
+      const r = await fetch(encodeURI(name));
+      if(!r.ok) continue;
+      parse(new Uint8Array(await r.arrayBuffer()));
+      persistState(); render();
+      return;
+    } catch(e){}
+  }
 });
 
 const drop = document.getElementById('drop'), fileInput = document.getElementById('file');
@@ -312,7 +318,7 @@ function readFile(f){
   r.onload = e => {
     try {
       parse(new Uint8Array(e.target.result));
-      dirty = false; editedCells = {};
+      dirty = false; editedBySheet = {};
       persistState();
       render();
     }
@@ -344,6 +350,29 @@ function parse(buf){
   }
   if(!items.length) throw new Error('明細行が見つかりません');
   DATA = items;
+
+  // 収入管理シート（あれば給料・プール資金をExcelと同期）
+  INCOME = null; INCOME_SHEET = null;
+  const incName = wb.SheetNames.find(n => n.includes('収入管理'));
+  if(incName){
+    const irows = XLSX.utils.sheet_to_json(wb.Sheets[incName], {header:1, defval:null});
+    const ihi = irows.findIndex(r => r && r.includes('4月'));
+    if(ihi >= 0){
+      const icols = {}; MONTHS.forEach(m => icols[m] = irows[ihi].indexOf(m));
+      const findRow = kw => { const i = irows.findIndex(r => r && typeof r[0] === 'string' && r[0].includes(kw)); return i >= 0 ? i + 1 : null; };
+      const rs = findRow('給料'), rp = findRow('プール');
+      if(rs && rp){
+        const amounts = {};
+        MONTHS.forEach(m => {
+          const g = r => { const v = irows[r-1] ? irows[r-1][icols[m]] : null; return typeof v === 'number' ? v : 0; };
+          amounts[m] = { s: g(rs), p: g(rp) };
+        });
+        const colLetters = {}; MONTHS.forEach(m => colLetters[m] = XLSX.utils.encode_col(icols[m]));
+        INCOME = { rows: { s: rs, p: rp }, cols: colLetters, amounts };
+        INCOME_SHEET = incName;
+      }
+    }
+  }
   // デフォルト月: 今日の月（年度: 4月始まり）
   const nowM = new Date().getMonth() + 1;
   current = nowM + '月';
@@ -445,7 +474,8 @@ function render(){
   const incTotal = (inc.s || 0) + (inc.p || 0);
   const viz = document.getElementById('fund-viz');
   if(incTotal === 0){
-    viz.innerHTML = '<p style="color:var(--sub);font-size:12px">給料とプール資金を入力すると、この月の引き落とし合計に足りるかを判定します（入力は月ごとにこの端末へ自動保存）</p>';
+    viz.innerHTML = '<p style="color:var(--sub);font-size:12px">給料とプール資金を入力すると、この月の引き落とし合計に足りるかを判定します'
+      + (INCOME ? '（Excelの「収入管理」シートに保存されます）' : '（月ごとにこの端末へ自動保存）') + '</p>';
   } else {
     const pct = total / incTotal;
     const diff = incTotal - total;
@@ -469,13 +499,17 @@ async function onAmt(row, input){
   const v = raw === '' ? null : Number(raw);
   if(raw !== '' && !isFinite(v)){ input.value = it.amounts[current] || ''; return; }
   it.amounts[current] = v || 0;
-  editedCells[`${MCOL_LETTER[current]}${row}`] = v;
+  (editedBySheet[SHEET_NAME] = editedBySheet[SHEET_NAME] || {})[`${MCOL_LETTER[current]}${row}`] = v;
   dirty = true;
-  // 入力を即座にワークブックへ反映し、ブラウザ内に自動保存（閉じても消えない）
+  await bakeAndPersist();
+}
+
+// 入力を即座にワークブックへ反映し、ブラウザ内に自動保存（閉じても消えない）
+async function bakeAndPersist(){
   try {
     rawBuf = await buildPatchedXlsx();
-    editedCells = {};
-  } catch(e){ /* 反映失敗時は editedCells に残るので保存時に再適用される */ }
+    editedBySheet = {};
+  } catch(e){ /* 反映失敗時は editedBySheet に残るので保存時に再適用される */ }
   persistState();
   render();
 }
@@ -498,45 +532,47 @@ async function buildPatchedXlsx(){
   const zip = await JSZip.loadAsync(rawBuf);
   const parser = new DOMParser(), ser = new XMLSerializer();
 
-  // 対象シートのXMLパスを workbook.xml + rels から特定
+  // 編集のあった各シートのXMLパスを workbook.xml + rels から特定してパッチ
   const wbDoc = parser.parseFromString(await zip.file('xl/workbook.xml').async('string'), 'application/xml');
-  const sheetEl = [...wbDoc.getElementsByTagName('sheet')].find(s => s.getAttribute('name') === SHEET_NAME);
-  if(!sheetEl) throw new Error('シート定義が見つかりません');
-  const rid = sheetEl.getAttribute('r:id') || sheetEl.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id');
   const relsDoc = parser.parseFromString(await zip.file('xl/_rels/workbook.xml.rels').async('string'), 'application/xml');
-  const rel = [...relsDoc.getElementsByTagName('Relationship')].find(r => r.getAttribute('Id') === rid);
-  let target = rel.getAttribute('Target');
-  const sheetPath = target.startsWith('/') ? target.slice(1) : 'xl/' + target;
+  for(const [sheetName, cells] of Object.entries(editedBySheet)){
+    if(!Object.keys(cells).length) continue;
+    const sheetEl = [...wbDoc.getElementsByTagName('sheet')].find(s => s.getAttribute('name') === sheetName);
+    if(!sheetEl) throw new Error('シート定義が見つかりません: ' + sheetName);
+    const rid = sheetEl.getAttribute('r:id') || sheetEl.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id');
+    const rel = [...relsDoc.getElementsByTagName('Relationship')].find(r => r.getAttribute('Id') === rid);
+    let target = rel.getAttribute('Target');
+    const sheetPath = target.startsWith('/') ? target.slice(1) : 'xl/' + target;
 
-  // セル値をパッチ
-  const doc = parser.parseFromString(await zip.file(sheetPath).async('string'), 'application/xml');
-  const ns = doc.documentElement.namespaceURI;
-  const sheetData = doc.getElementsByTagName('sheetData')[0];
-  for(const [ref, val] of Object.entries(editedCells)){
-    const rc = XLSX.utils.decode_cell(ref);
-    let rowEl = [...sheetData.children].find(r => +r.getAttribute('r') === rc.r + 1);
-    if(!rowEl){
-      rowEl = doc.createElementNS(ns, 'row');
-      rowEl.setAttribute('r', rc.r + 1);
-      const next = [...sheetData.children].find(r => +r.getAttribute('r') > rc.r + 1);
-      sheetData.insertBefore(rowEl, next || null);
+    const doc = parser.parseFromString(await zip.file(sheetPath).async('string'), 'application/xml');
+    const ns = doc.documentElement.namespaceURI;
+    const sheetData = doc.getElementsByTagName('sheetData')[0];
+    for(const [ref, val] of Object.entries(cells)){
+      const rc = XLSX.utils.decode_cell(ref);
+      let rowEl = [...sheetData.children].find(r => +r.getAttribute('r') === rc.r + 1);
+      if(!rowEl){
+        rowEl = doc.createElementNS(ns, 'row');
+        rowEl.setAttribute('r', rc.r + 1);
+        const next = [...sheetData.children].find(r => +r.getAttribute('r') > rc.r + 1);
+        sheetData.insertBefore(rowEl, next || null);
+      }
+      let cEl = [...rowEl.children].find(c => c.getAttribute('r') === ref);
+      if(!cEl){
+        cEl = doc.createElementNS(ns, 'c');
+        cEl.setAttribute('r', ref);
+        const next = [...rowEl.children].find(c => XLSX.utils.decode_cell(c.getAttribute('r')).c > rc.c);
+        rowEl.insertBefore(cEl, next || null);
+      }
+      cEl.removeAttribute('t');
+      [...cEl.children].forEach(ch => { if(ch.localName === 'v' || ch.localName === 'f' || ch.localName === 'is') cEl.removeChild(ch); });
+      if(val !== null){
+        const vEl = doc.createElementNS(ns, 'v');
+        vEl.textContent = String(val);
+        cEl.appendChild(vEl);
+      }
     }
-    let cEl = [...rowEl.children].find(c => c.getAttribute('r') === ref);
-    if(!cEl){
-      cEl = doc.createElementNS(ns, 'c');
-      cEl.setAttribute('r', ref);
-      const next = [...rowEl.children].find(c => XLSX.utils.decode_cell(c.getAttribute('r')).c > rc.c);
-      rowEl.insertBefore(cEl, next || null);
-    }
-    cEl.removeAttribute('t');
-    [...cEl.children].forEach(ch => { if(ch.localName === 'v' || ch.localName === 'f' || ch.localName === 'is') cEl.removeChild(ch); });
-    if(val !== null){
-      const vEl = doc.createElementNS(ns, 'v');
-      vEl.textContent = String(val);
-      cEl.appendChild(vEl);
-    }
+    zip.file(sheetPath, ser.serializeToString(doc));
   }
-  zip.file(sheetPath, ser.serializeToString(doc));
 
   // Excelで開いたとき全数式を再計算させる（合計・他シートのキャッシュ値が古いままにならないように）
   let calcPr = wbDoc.getElementsByTagName('calcPr')[0];
@@ -553,7 +589,8 @@ async function buildPatchedXlsx(){
 
 async function saveFile(){
   try {
-    const buf = Object.keys(editedCells).length ? await buildPatchedXlsx() : rawBuf;
+    const pending = Object.values(editedBySheet).some(c => Object.keys(c).length);
+    const buf = pending ? await buildPatchedXlsx() : rawBuf;
     if(fileHandle){
       if((await fileHandle.requestPermission({ mode: 'readwrite' })) !== 'granted') throw new Error('書き込み許可が得られませんでした');
       const w = await fileHandle.createWritable();
@@ -567,7 +604,7 @@ async function saveFile(){
       URL.revokeObjectURL(a.href);
       toast('⬇️ ダウンロードしました。元のファイルと置き換えてください');
     }
-    rawBuf = buf; editedCells = {}; dirty = false;
+    rawBuf = buf; editedBySheet = {}; dirty = false;
     persistState();
     render();
   } catch(err){
@@ -583,19 +620,28 @@ function toggle(item){
   render();
 }
 
-// ===== 給料・プール資金（月ごとにブラウザへ自動保存） =====
+// ===== 給料・プール資金 =====
+// Excelに「収入管理」シートがあればそこへ書き込み（支出と同じ保存フロー）、なければブラウザ保存
 function getIncome(m){
+  if(INCOME) return INCOME.amounts[m];
   const all = JSON.parse(localStorage.getItem('kakei-income') || '{}');
   return all[m] || { s: 0, p: 0 };
 }
-function onIncome(field, input){
+async function onIncome(field, input){
   const raw = input.value.replace(/[¥,，\s]/g, '');
-  const v = raw === '' ? 0 : Number(raw);
-  if(!isFinite(v)){ input.value = getIncome(current)[field] || ''; return; }
-  const all = JSON.parse(localStorage.getItem('kakei-income') || '{}');
-  all[current] = { ...getIncome(current), [field]: v };
-  localStorage.setItem('kakei-income', JSON.stringify(all));
-  render();
+  const v = raw === '' ? null : Number(raw);
+  if(raw !== '' && !isFinite(v)){ input.value = getIncome(current)[field] || ''; return; }
+  if(INCOME){
+    INCOME.amounts[current][field] = v || 0;
+    (editedBySheet[INCOME_SHEET] = editedBySheet[INCOME_SHEET] || {})[INCOME.cols[current] + INCOME.rows[field]] = v;
+    dirty = true;
+    await bakeAndPersist();
+  } else {
+    const all = JSON.parse(localStorage.getItem('kakei-income') || '{}');
+    all[current] = { ...getIncome(current), [field]: v || 0 };
+    localStorage.setItem('kakei-income', JSON.stringify(all));
+    render();
+  }
 }
 
 function renderTrend(){
