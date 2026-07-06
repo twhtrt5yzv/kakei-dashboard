@@ -1,6 +1,6 @@
-const C = 'kakei-v1';
+const C = 'kakei-v2';
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(C).then(c => c.addAll(['./', './index.html'])));
+  e.waitUntil(caches.open(C).then(c => c.addAll(['./', './index.html', './xlsx.full.min.js', './jszip.min.js'])));
   self.skipWaiting();
 });
 self.addEventListener('activate', e => {
